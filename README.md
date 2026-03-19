@@ -94,7 +94,7 @@ Real-Time Monitoring: Weather + Platform + Traffic APIs
         ↓
 Disruption Detected in Worker's Zone
         ↓
-AI Eligibility Check: Was worker active? Was zone affected?
+Eligibility Check: Did disruption fall within worker's established shift window?
         ↓
 Anti-Spoofing Verification (Multi-signal)
         ↓
@@ -174,10 +174,21 @@ A **parametric trigger** is an objectively measurable external event that activa
 |------------|-------------|-------------|-----------|-------------------|
 | T-01 | Heavy Rainfall | OpenWeather API + IMD | Rainfall > 40mm/3hr in worker's pin-code | Per hour of documented disruption |
 | T-02 | Cyclone/Severe Storm Alert | IMD Official API | Orange/Red Alert issued for city | Full alert duration |
-| T-03 | Air Quality Shutdown | CPCB AQI API + Government advisory | AQI > 400 + Government advisory issued | Advisory duration |
-| T-04 | Platform Outage | Platform status API + Crowdsourced signal | >60% order drop in zone + API status page down | Outage window |
-| T-05 | Civil Disruption/Bandh | News API + Traffic API + Government feed | Road blockage detected in >3 major arteries in zone | Duration of disruption |
-| T-06 | Natural Disaster Alert | NDMA/IMD API | Official disaster advisory issued | Advisory duration |
+| T-03 | Extreme Heat | OpenWeatherMap | Temperature > 42°C in worker's zone | Per hour above threshold |
+| T-04 | Air Quality Shutdown | CPCB AQI API + Government advisory | AQI > 400 + Government advisory issued | Advisory duration |
+| T-05 | Platform Outage | Platform status API + Crowdsourced signal | >60% order drop in zone + API status page down | Outage window |
+| T-06 | Civil Disruption/Bandh | News API + Traffic API + Government feed | Road blockage detected in >3 major arteries in zone | Duration of disruption |
+| T-07 | Natural Disaster / Flood Alert | NDMA/IMD API | Official disaster advisory issued | Advisory duration |
+
+### Eligibility Condition
+
+A claim triggers only when **all three** conditions are met:
+
+1. **Zone match** — Disruption is confirmed in the worker's registered pincode zone
+2. **Shift window match** — Disruption falls within the worker's established working hours, derived from their 30-day activity history (e.g., if Ravi typically works Mon–Sat 10am–10pm, only disruptions within that window count)
+3. **Active policy** — Worker has a valid paid policy for that week
+
+> A worker does **not** need to have started a delivery or accepted an order when the disruption hits. Being about to start their shift is sufficient — the income loss is real regardless of whether the first order had been picked up. The shift window check handles this: if the disruption falls within their normal working hours, they are eligible.
 
 ### Payout Formula Per Trigger
 
@@ -189,14 +200,17 @@ Payout = min(
 
 Where:
   avg_hourly_earnings = worker's 30-day rolling average ÷ 30-day active hours
-  disruption_hours = verified hours of disruption in worker's zone
-  coverage_factor = 0.75 (75% income replacement — retains worker skin in game)
+  disruption_hours    = verified hours of disruption within worker's shift window
+  coverage_factor     = 0.75 (75% income replacement)
 ```
+
+**Why 0.75 and not 1.0 — Basis Risk:**
+Parametric insurance by design does not perfectly match individual loss. A worker who had planned a day off but still had a disruption in their shift window receives 75% of their average hourly earnings — a small windfall. This is **basis risk**, and it is intentional. The 75% factor prices this in. Attempting to verify individual intent (did they plan to work?) would require proof, which defeats the zero-touch model. The loss ratio model (target: <0.70) accounts for this leakage. Claim frequency monitoring flags workers who claim every disruption event with no working activity, as a soft fraud signal over time.
 
 **Example:**
 Ravi earns ₹750/day avg, works 10 hrs → ₹75/hr.
-Monsoon shuts his zone for 3 hours on Wednesday.
-Payout = ₹75 × 3 × 0.75 = **₹168.75**, auto-disbursed to UPI.
+Monsoon shuts his zone for 3 hours on Wednesday during his shift window.
+Payout = ₹75 × 3 × 0.75 = **₹168.75**, auto-disbursed to UPI — whether he had started delivering or was just about to.
 
 ---
 
@@ -310,87 +324,15 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 
 ## 8. Architecture Overview
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                            CLIENT                                    │
-│         ┌──────────────────┐       ┌──────────────────┐             │
-│         │   Mobile PWA     │       │  Admin Dashboard  │             │
-│         │   (Worker UI)    │       │  (Insurer View)   │             │
-│         └────────┬─────────┘       └────────┬──────────┘             │
-│                  └──────────┬───────────────┘                        │
-└─────────────────────────────┼──────────────────────────────────────-─┘
-                              ▼
-                   ┌─────────────────────┐
-                   │     API Gateway     │
-                   │  (Auth + Rate Limit)│
-                   └──────────┬──────────┘
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                            CORE                                     │
-│         ┌───────────────────┐      ┌──────────────────────────┐    │
-│         │   Policy Service  │      │      Claim Service        │    │
-│         │                   │      │  (auto-trigger + manual)  │    │
-│         └─────────┬─────────┘      └────────────┬─────────────┘    │
-└───────────────────┼────────────────────────────-─┼──────────────────┘
-          ┌─────────┘                              │
-          ▼                                        ▼
-┌─────────────────────────┐       ┌────────────────────────────────────┐
-│        ML LAYER         │       │        ANTI-SPOOFING ENGINE        │
-│                         │       │                                    │
-│  ┌─────────────────┐    │       │  ┌──────────────────────────────┐ │
-│  │  Risk Engine    │    │       │  │  Rider Zone Profiler         │ │
-│  │  (Pricing)      │    │       │  │  (90-day delivery heatmap)   │ │
-│  ├─────────────────┤    │◄─────►│  ├──────────────────────────────┤ │
-│  │  Pricing Engine │    │       │  │  Zone Integrity Check        │ │
-│  │  (Python/XGB)   │    │       │  ├──────────────────────────────┤ │
-│  ├─────────────────┤    │       │  │  Strava API Verifier         │ │
-│  │  Fraud Detector │    │       │  ├──────────────────────────────┤ │
-│  │  (Iso. Forest)  │    │       │  │  Claim Decision Engine       │ │
-│  └─────────────────┘    │       │  └──────────────────────────────┘ │
-└─────────────────────────┘       │         ↕ Human + AI Review       │
-                                  └────────────────────────────────────┘
-          │                                        │
-          └──────────────────┬─────────────────────┘
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        EXTERNAL DATA                                │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐   │
-│  │  IP Geolocation │  │  Cell Tower API  │  │ OpenWeatherMap   │   │
-│  └─────────────────┘  └─────────────────┘  └──────────────────┘   │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐   │
-│  │  Air Quality    │  │  Brave Search   │  │    News API      │   │
-│  │  (CPCB AQI)     │  │  (civil events) │  │  (IMD / NDMA)    │   │
-│  └─────────────────┘  └─────────────────┘  └──────────────────┘   │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                            EVENTS                                   │
-│  ┌──────────────────┐  ┌──────────────┐  ┌────────────────────┐   │
-│  │ Razorpay Service │  │    Kafka     │  │   Trigger Engine   │   │
-│  │  (UPI/IMPS)      │  │  (streaming) │  │ (15-min zone scan) │   │
-│  └──────────────────┘  └──────────────┘  └────────────────────┘   │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                            OUTPUT                                   │
-│  ┌──────────────┐   ┌───────────────────────┐   ┌──────────────┐  │
-│  │   Firebase   │   │       Razorpay        │   │    Stripe    │  │
-│  │  (Notifs /   │   │ (UPI payout — primary)│   │  (fallback)  │  │
-│  │  WhatsApp)   │   └───────────────────────┘   └──────────────┘  │
-│  └──────────────┘                                                  │
-└─────────────────────────────────────────────────────────────────────┘
+![GigShield Architecture](./Public/architecture.png)
 
-DATA LAYER (connected to Core + ML Layer):
-  ├── Redis       — session state, zone disruption cache, rate limiting
-  ├── MongoDB     — worker profiles, claims, zone events (document model)
-  └── PostgreSQL  — policies, premiums, payouts (ACID transactional)
-```
-
-**Flow summary (color-coded in architecture diagram):**
+**Flow summary:**
 - **Fraud/verification signals** flow bidirectionally between ML Layer and Anti-Spoofing Engine
 - **External data** feeds both the Trigger Engine (parametric events) and the Anti-Spoofing Engine (location corroboration)
 - **Claim decisions** propagate from the Claim Decision Engine through the Events layer to Output
 - **Rejected claims** loop back to the Human + AI review queue before any account action
+
+**Data Layer:** Redis (session state, zone disruption cache) · MongoDB (worker profiles, claims, zone events) · PostgreSQL (policies, premiums, payouts — ACID)
 
 ---
 
@@ -506,13 +448,16 @@ This makes coordinated fraud expensive: the syndicate cannot fabricate official 
 
 #### Signal Layer 4: Behavioral Fingerprinting & Temporal Consistency
 
+> Note: A worker does not need to have been mid-delivery for a claim to be valid. Eligibility is based on shift window, not order status. These signals detect behavioral *inconsistency*, not absence of activity.
+
 | Signal | What It Detects |
 |--------|----------------|
-| Pre-disruption order activity | Was worker on an active delivery when disruption hit? Zero active orders at claim time = soft flag |
-| Accelerometer pattern | Stationary vs moving device during "stranded in storm" claim |
+| Device location consistency | Is device physically in the zone during disruption, or at home? Cross-checked via cell tower + Wi-Fi fingerprint — not order status |
+| Accelerometer pattern | Stationary-at-home pattern vs. out-in-field pattern during disruption window |
 | Claim-initiation latency | Claims filed < 30 sec after trigger fire are flagged — genuine workers don't have push-to-claim reflexes |
-| Strava / fitness app cross-check | Did worker log movement incompatible with being stranded? (Opt-in, incentivised with premium discount) |
-| Cross-platform order data | If worker completed a delivery during the "disrupted" window → claim auto-rejected |
+| Strava / fitness app cross-check | Did worker log movement incompatible with being in a disrupted zone? (Opt-in, incentivised with premium discount) |
+| Orders completed during disruption | If worker completed a delivery *during* the disrupted window → claim auto-rejected (they were clearly working through it) |
+| Claim frequency pattern | Worker claiming every disruption event with zero post-disruption activity across multiple weeks → soft fraud escalation over time |
 | Onboarding recency | < 2 weeks tenure + max-value Week 1 claim → elevated scrutiny |
 
 ---
