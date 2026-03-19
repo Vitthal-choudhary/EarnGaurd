@@ -18,6 +18,12 @@
 8. [Architecture Overview](#8-architecture-overview)
 9. [Tech Stack](#9-tech-stack)
 10. [Adversarial Defense & Anti-Spoofing Strategy](#10-adversarial-defense--anti-spoofing-strategy)
+    - [Threat Model](#101-the-threat-model)
+    - [Multi-Signal Verification Stack](#102-the-multi-signal-verification-stack)
+    - [Fraud Ring Detection](#103-fraud-ring-detection)
+    - [Decision Engine (GREEN/YELLOW/RED)](#104-the-decision-engine)
+    - [Protecting Honest Workers](#105-protecting-honest-workers-ux-balance)
+    - [What the Syndicate Cannot Fake](#106-what-the-syndicate-cannot-fake)
 11. [Development Roadmap](#11-development-roadmap)
 
 ---
@@ -196,35 +202,82 @@ Payout = ₹75 × 3 × 0.75 = **₹168.75**, auto-disbursed to UPI.
 
 ## 6. AI/ML Integration Plan
 
-### 6.1 Dynamic Premium Pricing Engine
+GigShield uses three purpose-built models. Models 1 and 2 are customer-facing and directly affect payouts. Model 3 powers the admin dashboard and is built in Phase 3.
 
-- **Model Type**: Gradient Boosted Regression (XGBoost/LightGBM)
-- **Input Features**: Zone-level disruption history, seasonal indices, worker tenure, claim frequency, AQI rolling averages, platform stability scores
-- **Output**: Weekly risk multiplier (0.7x–2.0x)
-- **Retraining**: Weekly, on ingested disruption + claim data
+---
 
-### 6.2 Fraud Detection Engine
+### 6.1 Model 1 — Premium Calculator (XGBoost)
 
-- **Model Type**: Ensemble (Isolation Forest + LSTM anomaly detection)
-- **Signals used**:
-  - Claim rate deviation from zone baseline
-  - GPS trajectory vs expected zone behavior
-  - Behavioral fingerprint (app usage patterns)
-  - Social graph of claim clusters (are all claimants in a Telegram group?)
-- **Output**: Fraud probability score (0–1), auto-approve below 0.3, flag above 0.7, human+AI review between 0.3–0.7
+**Purpose**: Compute a personalised weekly premium in ₹ at onboarding and at every policy renewal.
 
-### 6.3 Zone-Level Disruption Classifier
+**Datasets Used:**
 
-- **Model Type**: Multi-source signal aggregation + threshold classifier
-- **Inputs**: Weather API, traffic API, platform order volume drop, news sentiment
-- **Output**: Binary disruption flag per zone per 15-minute window
-- **Latency target**: < 90 seconds from event to flag
+| Dataset | Source | What It Provides |
+|---------|--------|-----------------|
+| IMD District Rainfall (2015–2024) | imdpune.gov.in | Zone-level heavy-rain probability per pincode — the primary risk signal |
+| WAQI Historical AQI | aqicn.org/data-platform | City-level hazardous AQI day frequency for pollution-event risk scoring |
+| data.gov.in Pincode Directory | data.gov.in | Maps worker pincode → district → IMD zone risk score (the glue dataset) |
+| PLFS Gig Worker Earnings 2023 | mospi.gov.in | Real earnings distributions by city for premium calibration and payout caps |
 
-### 6.4 Worker Income Baseline Model
+**Method**: XGBoost Gradient Boosted Regression
+**Inputs**: Zone risk score (from IMD), AQI risk, platform type, monthly earnings, work hours/day, season, claim history, coverage tier
+**Output**: `weekly_premium_inr`, `risk_tier` (Low/Medium/High), `max_daily_payout`, `breakeven_days`
 
-- **Purpose**: Estimate expected earnings for a disruption window (what the worker *would have* earned)
-- **Approach**: Time-series forecasting (Prophet/SARIMA) per worker, accounting for day-of-week, time-of-day, and seasonal effects
-- **Cold start**: New workers use zone-level averages until 4 weeks of personal data accumulates
+**Why XGBoost**: Handles the heterogeneous feature mix (categorical platform type + numerical risk scores + seasonal flags) without normalisation. Produces interpretable feature importance for actuarial review — critical when insurers need to justify premium differentials across zones. Fast inference (<10 ms) suits real-time onboarding. IMD data shows Mumbai Suburban at 0.18 heavy-rain probability vs Bengaluru Urban at 0.06 — a 3x differential that the model captures and prices accurately.
+
+---
+
+### 6.2 Model 2 — Fraud Detector (Rule Engine → Isolation Forest)
+
+**Purpose**: Score every auto-triggered claim 0.0–1.0 for fraud risk before any payout is released.
+
+**Datasets Used:**
+
+| Dataset | Source | What It Provides |
+|---------|--------|-----------------|
+| Kaggle Auto Insurance Claims | kaggle.com | 15,000+ labeled fraud/non-fraud claims for supervised training baseline |
+| Live GPS + Cell Tower signals | OpenCelliD, device | Real-time location authenticity cross-check |
+| Worker behavioral history | Internal DB | Baseline delivery patterns, claim frequency, zone heatmaps |
+
+**Method**: Two-phase approach
+- **Phase 2** — Deterministic rule engine: 5 checks (GPS distance, time window, amount ratio, claim frequency, duplicate detection) produce a weighted score
+- **Phase 3** — Isolation Forest blended with rule score (60% rules + 40% ML), trained on the Kaggle dataset with GigShield-specific feature mapping
+
+| Score | Decision |
+|-------|----------|
+| 0.0 – 0.29 | Auto-approve — payout released immediately |
+| 0.30 – 0.69 | Manual review — 30-minute SLA |
+| 0.70 – 1.0 | Auto-reject — logged for pattern analysis |
+
+**Why Isolation Forest**: Unsupervised anomaly detection — does not require large labeled GigShield-specific fraud datasets to function, which matters for a bootstrapping platform. It naturally isolates rare fraud events embedded in dense legitimate claim distributions, with no assumptions about the fraud feature distribution. The blended approach ensures the rule engine catches obvious fraud immediately while the ML layer catches subtle coordinated patterns that rules miss.
+
+---
+
+### 6.3 Model 3 — Predictive Analytics (Facebook Prophet)
+
+**Purpose**: Forecast next week's disruption frequency per zone and projected loss ratio — powers the admin/insurer dashboard. **Built in Phase 3 only.**
+
+**Datasets Used:**
+
+| Dataset | Source | What It Provides |
+|---------|--------|-----------------|
+| Historical disruption events | IMD API, CPCB AQI | Seasonal disruption frequency per zone over time |
+| Accumulated claim + payout data | Internal DB | Loss ratio actuals for model calibration |
+| OpenWeatherMap historical | openweathermap.org | Extended weather baseline for forecast anchoring |
+
+**Method**: Facebook Prophet with custom seasonal regressors
+**Output**: Next 4 weeks of expected disruption frequency per zone + predicted loss ratio (target: stay below 0.70)
+
+**Why Prophet**: Built-in seasonality decomposition handles India's monsoon cycle (weeks 24–40 are structurally high-frequency) without manual feature engineering. Handles data gaps gracefully — critical for a startup with sparse early-stage data. Weekly and daily delivery cycles are captured as additive seasonality components, giving insurers accurate forward-looking loss estimates for capital reservation.
+
+---
+
+### 6.4 Live Trigger Engine
+
+**Method**: Multi-source signal aggregation + threshold classifier, running as a background job every 15 minutes
+**Inputs**: OpenWeatherMap (rain > 15 mm/hr, temp > 42°C), CPCB AQI (> 300), IMD flood/cyclone flags, government curfew feeds
+**Output**: Binary disruption flag per zone per 15-minute window → automatically calls fraud scorer → if auto-approved → Razorpay payout → WhatsApp notification
+**Latency target**: < 90 seconds from event detection to payout initiation
 
 ---
 
@@ -258,63 +311,86 @@ Payout = ₹75 × 3 × 0.75 = **₹168.75**, auto-disbursed to UPI.
 ## 8. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          CLIENT LAYER                               │
-│  ┌──────────────┐    ┌─────────────────┐                           │
-│  │  Mobile PWA  │    │  Admin Dashboard │                           │
-│  │  (Worker UI) │    │  (Insurer View)  │                           │
-│  └──────┬───────┘    └────────┬─────────┘                           │
-│         └──────────┬──────────┘                                     │
-└────────────────────┼────────────────────────────────────────────────┘
-                     ▼
-         ┌───────────────────────┐
-         │     API Gateway       │
-         │  (Auth + Rate Limit)  │
-         └─────────┬─────────────┘
-                   ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                        CORE MICROSERVICES                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
-│  │ User Service │  │Policy Service│  │     Claim Service        │   │
-│  │              │  │              │  │ (auto-trigger + manual)  │   │
-│  └──────────────┘  └──────────────┘  └──────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-                   │                        │
-         ┌─────────▼───────────┐   ┌───────▼────────────────────────┐
-         │    ML LAYER         │   │     ANTI-SPOOFING ENGINE        │
-         │                     │   │                                 │
-         │  ┌───────────────┐  │   │  ┌───────────────────────────┐ │
-         │  │  Risk Engine  │  │   │  │   Rider Zone Profiler     │ │
-         │  │ (Pricing)     │  │   │  │   Zone Integrity Check    │ │
-         │  ├───────────────┤  │   │  │   Strava API Verifier     │ │
-         │  │ Fraud Detect  │  │   │  │   Claim Decision Engine   │ │
-         │  └───────────────┘  │   │  └───────────────────────────┘ │
-         └─────────────────────┘   │        ↕ Human+AI Review       │
-                                   └────────────────────────────────┘
-                   │
-┌──────────────────▼───────────────────────────────────────────────────┐
-│                     EXTERNAL DATA SOURCES                            │
-│  OpenWeatherMap │ IMD API │ CPCB AQI │ Cell Tower API              │
-│  IP Geolocation │ Maps API │ Brave Search │ Platform Status APIs    │
-└──────────────────────────────────────────────────────────────────────┘
-                   │
-         ┌─────────▼─────────────────────┐
-         │     EVENT STREAMING (Kafka)    │
-         │  Trigger Engine (zone events)  │
-         └─────────┬─────────────────────┘
-                   ▼
+│                            CLIENT                                    │
+│         ┌──────────────────┐       ┌──────────────────┐             │
+│         │   Mobile PWA     │       │  Admin Dashboard  │             │
+│         │   (Worker UI)    │       │  (Insurer View)   │             │
+│         └────────┬─────────┘       └────────┬──────────┘             │
+│                  └──────────┬───────────────┘                        │
+└─────────────────────────────┼──────────────────────────────────────-─┘
+                              ▼
+                   ┌─────────────────────┐
+                   │     API Gateway     │
+                   │  (Auth + Rate Limit)│
+                   └──────────┬──────────┘
+                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         OUTPUT / PAYOUT                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐   │
-│  │   Razorpay   │  │    Stripe    │  │   Firebase (Notifs)     │   │
-│  │  (UPI/IMPS)  │  │  (Fallback)  │  │   WhatsApp Business API │   │
-│  └──────────────┘  └──────────────┘  └─────────────────────────┘   │
+│                            CORE                                     │
+│         ┌───────────────────┐      ┌──────────────────────────┐    │
+│         │   Policy Service  │      │      Claim Service        │    │
+│         │                   │      │  (auto-trigger + manual)  │    │
+│         └─────────┬─────────┘      └────────────┬─────────────┘    │
+└───────────────────┼────────────────────────────-─┼──────────────────┘
+          ┌─────────┘                              │
+          ▼                                        ▼
+┌─────────────────────────┐       ┌────────────────────────────────────┐
+│        ML LAYER         │       │        ANTI-SPOOFING ENGINE        │
+│                         │       │                                    │
+│  ┌─────────────────┐    │       │  ┌──────────────────────────────┐ │
+│  │  Risk Engine    │    │       │  │  Rider Zone Profiler         │ │
+│  │  (Pricing)      │    │       │  │  (90-day delivery heatmap)   │ │
+│  ├─────────────────┤    │◄─────►│  ├──────────────────────────────┤ │
+│  │  Pricing Engine │    │       │  │  Zone Integrity Check        │ │
+│  │  (Python/XGB)   │    │       │  ├──────────────────────────────┤ │
+│  ├─────────────────┤    │       │  │  Strava API Verifier         │ │
+│  │  Fraud Detector │    │       │  ├──────────────────────────────┤ │
+│  │  (Iso. Forest)  │    │       │  │  Claim Decision Engine       │ │
+│  └─────────────────┘    │       │  └──────────────────────────────┘ │
+└─────────────────────────┘       │         ↕ Human + AI Review       │
+                                  └────────────────────────────────────┘
+          │                                        │
+          └──────────────────┬─────────────────────┘
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        EXTERNAL DATA                                │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐   │
+│  │  IP Geolocation │  │  Cell Tower API  │  │ OpenWeatherMap   │   │
+│  └─────────────────┘  └─────────────────┘  └──────────────────┘   │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐   │
+│  │  Air Quality    │  │  Brave Search   │  │    News API      │   │
+│  │  (CPCB AQI)     │  │  (civil events) │  │  (IMD / NDMA)    │   │
+│  └─────────────────┘  └─────────────────┘  └──────────────────┘   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                            EVENTS                                   │
+│  ┌──────────────────┐  ┌──────────────┐  ┌────────────────────┐   │
+│  │ Razorpay Service │  │    Kafka     │  │   Trigger Engine   │   │
+│  │  (UPI/IMPS)      │  │  (streaming) │  │ (15-min zone scan) │   │
+│  └──────────────────┘  └──────────────┘  └────────────────────┘   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                            OUTPUT                                   │
+│  ┌──────────────┐   ┌───────────────────────┐   ┌──────────────┐  │
+│  │   Firebase   │   │       Razorpay        │   │    Stripe    │  │
+│  │  (Notifs /   │   │ (UPI payout — primary)│   │  (fallback)  │  │
+│  │  WhatsApp)   │   └───────────────────────┘   └──────────────┘  │
+│  └──────────────┘                                                  │
 └─────────────────────────────────────────────────────────────────────┘
 
-DATA LAYER:
-  ├── MongoDB (worker profiles, claims, events — document model)
-  └── PostgreSQL (policies, premiums, payouts — transactional integrity)
+DATA LAYER (connected to Core + ML Layer):
+  ├── Redis       — session state, zone disruption cache, rate limiting
+  ├── MongoDB     — worker profiles, claims, zone events (document model)
+  └── PostgreSQL  — policies, premiums, payouts (ACID transactional)
 ```
+
+**Flow summary (color-coded in architecture diagram):**
+- **Fraud/verification signals** flow bidirectionally between ML Layer and Anti-Spoofing Engine
+- **External data** feeds both the Trigger Engine (parametric events) and the Anti-Spoofing Engine (location corroboration)
+- **Claim decisions** propagate from the Claim Decision Engine through the Events layer to Output
+- **Rejected claims** loop back to the Human + AI review queue before any account action
 
 ---
 
@@ -370,154 +446,150 @@ DATA LAYER:
 
 ## 10. Adversarial Defense & Anti-Spoofing Strategy
 
-> **Context**: A coordinated fraud syndicate of 500 workers in a Tier-1 city is using GPS-spoofing applications to fake locations, claiming to be stranded in weather zones while resting at home, triggering mass false payouts and draining the liquidity pool.
+> **Threat scenario**: A coordinated syndicate of 500 delivery workers in a Tier-1 city used GPS-spoofing apps to fake locations, appearing stranded in weather zones while resting at home. Coordinated via Telegram, they triggered mass false payouts and drained the liquidity pool.
 >
-> **Ruling**: Simple GPS verification is officially obsolete. This section defines GigShield's multi-layered defense.
+> **Design ruling**: Simple GPS verification is obsolete. GigShield's defense is built on one core insight — **a real crisis leaves a consistent fingerprint across multiple independent signals; a spoofer can only fake one or two.**
 
 ---
 
 ### 10.1 The Threat Model
 
-GPS spoofing via apps like Fake GPS, iToolab AnyGo, or rooted-device mock providers is trivially accessible. A coordinated syndicate doesn't need technical sophistication — they need a Telegram channel and a free APK.
+GPS spoofing via apps like Fake GPS, iToolab AnyGo, or rooted-device mock providers requires no technical sophistication — just a Telegram channel and a free APK.
 
-The key insight is that **a spoofed GPS signal is a single data point**. The attacker cannot simultaneously spoof:
-- Cell tower triangulation data
-- IP geolocation
-- Device motion sensor readings
-- Historical behavioral patterns
-- Platform-side order activity data
-- Network signal characteristics during the claimed "disruption zone"
+The attacker cannot simultaneously fake:
+- Cell tower triangulation (device pings real towers in the claimed zone)
+- IP geolocation (home broadband vs mobile data in field)
+- Device sensor readings (accelerometer, Wi-Fi SSID)
+- Historical delivery patterns (90-day heatmap of where the worker actually operates)
+- Independent public news corroboration of the crisis event
+- Claim timing variance (coordinated rings file at the same second; genuine workers file gradually)
 
-Our defense exploits this asymmetry.
+Our defense exploits this asymmetry across four signal layers.
 
 ---
 
 ### 10.2 The Multi-Signal Verification Stack
 
-GigShield collects and cross-correlates the following signals for every claim event. No single signal determines outcome — the system builds a **confidence composite**:
-
 #### Signal Layer 1: Location Authenticity (Beyond GPS)
 
 | Signal | What It Detects | How |
 |--------|----------------|-----|
-| Cell Tower Triangulation | Physical device location independent of GPS | OpenCelliD API — towers worker's device is pinging |
-| IP Geolocation | VPN/proxy usage, rough location match | Device IP vs claimed GPS zone |
-| Wi-Fi SSID fingerprint | Is device connected to home Wi-Fi during "field" claim? | Passive detection in app (only metadata, no SSID value stored) |
-| GPS Jitter Analysis | Spoofed GPS has unnaturally stable coordinates; real GPS has micro-drift | Statistical variance on GPS readings over 5-min window |
+| Cell Tower Triangulation | Physical device location independent of GPS | OpenCelliD API — tower IDs the device is pinging |
+| IP Geolocation | VPN/proxy usage, home broadband vs mobile data in field | Device IP vs claimed GPS zone |
+| Wi-Fi SSID Fingerprint | Device connected to home Wi-Fi while claiming to be in a flood zone | Passive detection — only metadata flag stored, no SSID value |
+| GPS Jitter Analysis | Spoofed GPS has unnaturally perfect coordinates; real GPS micro-drifts | Statistical variance on GPS readings over 5-minute window |
 
-A worker genuinely stranded in a flooded zone will show:
-- Cell towers in that geographic cluster
-- IP consistent with mobile data (not home broadband)
-- GPS variance consistent with a stationary-but-real location
-- No home Wi-Fi SSID detected
+A spoofed actor at home shows stationary accelerometer + home Wi-Fi + perfect GPS coordinates — three contradictions in one claim.
 
-A spoofing actor will show discrepancies across 2–3 of these signals.
+#### Signal Layer 2: Historical Delivery Zone Match
 
-#### Signal Layer 2: Behavioral Fingerprinting
+Each worker's 90-day verified delivery history is stored as a **geospatial heatmap**. A claim from a zone where the worker has never delivered is immediately flagged — genuine workers get stranded where they actually work. This is the lowest-cost, highest-precision check and runs first in the pipeline.
 
-| Signal | What It Detects | How |
-|--------|----------------|-----|
-| Pre-disruption activity | Was worker actually on shift when disruption hit? | Platform API order history + app last-active timestamp |
-| Motion sensor data | Accelerometer patterns: is device on a stationary person vs a moving scooter? | On-device motion API (no raw data stored, only pattern flag) |
-| App interaction patterns | Worker opened GigShield app suspiciously close to the trigger window | Timestamp delta between app open and claim initiation |
-| Strava / fitness app activity | Did worker log a run during their "trapped" window? | Strava API OAuth cross-check (opt-in, incentivized with premium discount) |
+| Scenario | Result |
+|----------|--------|
+| Worker claims disruption in their established zone | Zone match — passes Layer 2 |
+| Worker claims disruption in a zone they've never operated in | Immediate flag — zone mismatch |
+| New worker (< 2 weeks) with no heatmap | Elevated scrutiny tier applied |
 
-#### Signal Layer 3: Zone-Level Claim Density Analysis
+#### Signal Layer 3: Real-Time Event Corroboration (Key Architectural Innovation)
 
-This is the most powerful signal against **coordinated rings**.
+Before any payout triggers, the system independently queries a live news and search API (Brave Search, NewsAPI) for verified public crisis reports — storm alerts, flood warnings, traffic authority notices — specific to the claimed zone and time window.
 
-```
-Fraud Ring Signature:
-  - Sudden spike in claims from one zone within a short window
-  - Claims initiated within seconds of each other (bot-like timing)
-  - Claimant network graph: multiple workers onboarded from same device or referral chain
-  - Claim pattern mirrors disruption window exactly — no variance in claim timing
-    (genuine workers file at different times as they realize the disruption)
+**The system does not rely solely on what the rider's device reports. It independently verifies whether the crisis actually happened.**
 
-Genuine Disruption Signature:
-  - Claims spread across the disruption window (not clustered at start)
-  - Claimant count matches expected active-worker count for that zone/time
-  - Claims come from workers with varied tenure, not mass-onboarded recently
-```
+If no corroborating public event exists for that location and time:
+- Claim is automatically held for review
+- Worker receives: *"We're verifying your coverage — you'll hear back within 2 hours"*
+- The news API check resolves most genuine claims automatically (if the event was real, it's in the news)
 
-The ML fraud model assigns a **Zone Anomaly Score** when:
-- Claims from a zone exceed 2 standard deviations above the historical average for that zone/trigger combination
-- Claim timing shows abnormal clustering (Poisson distribution test)
-- Network graph analysis reveals clique structure (workers with same referral source, device fingerprint)
+This makes coordinated fraud expensive: the syndicate cannot fabricate official IMD alerts, government advisories, or traffic authority notices.
 
-When Zone Anomaly Score is elevated, the entire zone's claims enter **enhanced review** — not just flagged individuals.
+#### Signal Layer 4: Behavioral Fingerprinting & Temporal Consistency
 
-#### Signal Layer 4: Temporal and Historical Consistency
-
-| Check | Logic |
-|-------|-------|
-| Claim frequency per worker | Worker filing claims in consecutive weeks without historical pattern is a soft flag |
-| Disruption-claim latency | Claims filed immediately when trigger fires (< 30 sec) are flagged — genuine workers don't have push-to-claim reflexes |
-| Cross-platform order data | If worker received orders during the "disrupted" window (via platform API), the claim is auto-rejected |
-| Onboarding recency | Workers who onboarded < 2 weeks ago and file a max-value claim in Week 1 face elevated scrutiny |
+| Signal | What It Detects |
+|--------|----------------|
+| Pre-disruption order activity | Was worker on an active delivery when disruption hit? Zero active orders at claim time = soft flag |
+| Accelerometer pattern | Stationary vs moving device during "stranded in storm" claim |
+| Claim-initiation latency | Claims filed < 30 sec after trigger fire are flagged — genuine workers don't have push-to-claim reflexes |
+| Strava / fitness app cross-check | Did worker log movement incompatible with being stranded? (Opt-in, incentivised with premium discount) |
+| Cross-platform order data | If worker completed a delivery during the "disrupted" window → claim auto-rejected |
+| Onboarding recency | < 2 weeks tenure + max-value Week 1 claim → elevated scrutiny |
 
 ---
 
-### 10.3 The Decision Engine
+### 10.3 Fraud Ring Detection
 
-Claims are scored across all four signal layers and assigned a **Fraud Probability Score (FPS)** from 0.0 to 1.0:
+Individual fraud is caught by conflicting device signals. **Coordinated ring fraud** is caught by the simultaneous appearance of three cluster signals:
+
+| Signal | Threshold | What It Indicates |
+|--------|-----------|------------------|
+| Claim Surge Velocity | 50+ claims from one zone within 10 minutes | Impossible in normal operations — coordinated trigger |
+| Geographic Clustering | Claims concentrated in an implausibly tight zone boundary | Ring operating from one Telegram group |
+| Device Fingerprint Similarity | Shared OS version, app install timestamp, hardware ID patterns | Same spoofing APK distributed within the ring |
+
+**Any two of the three** triggers a ring-level investigation: all related claims are automatically frozen pending review. The fraud model also runs a Poisson distribution test on claim timing — legitimate mass disruptions show spread-out filing; coordinated rings show uniform firing within seconds of each other.
+
+The network graph additionally detects clique structure: 500 ring members don't have 500 independent onboarding paths. Shared referral codes, same-device registration, or common KYC details collapse the graph quickly.
+
+---
+
+### 10.4 The Decision Engine
+
+Claims are scored across all layers and assigned a **Fraud Probability Score (FPS)** from 0.0 to 1.0:
 
 ```
 FPS = weighted_ensemble(
-  location_authenticity_score × 0.30,
-  behavioral_fingerprint_score × 0.25,
-  zone_anomaly_score × 0.30,
-  temporal_consistency_score × 0.15
+  location_authenticity_score      × 0.25,
+  delivery_zone_match_score        × 0.20,
+  news_corroboration_score         × 0.25,
+  behavioral_fingerprint_score     × 0.15,
+  zone_anomaly_score               × 0.15
 )
 ```
 
-| FPS Range | Action | Worker Experience |
-|-----------|--------|-------------------|
-| 0.0 – 0.30 | Auto-approve | Payout within 60 seconds |
-| 0.31 – 0.60 | Soft hold | "We're confirming your coverage — payout within 2 hours" |
-| 0.61 – 0.80 | Human + AI Review | Worker receives WhatsApp: "We need a quick check — reply CONFIRM to verify" |
-| 0.81 – 1.00 | Flagged / Rejected | Worker notified; appeal process available |
+| Tier | FPS Range | Action | Worker Experience |
+|------|-----------|--------|-------------------|
+| GREEN | 0.0 – 0.30 | Auto-approve | Payout within 60 seconds |
+| YELLOW | 0.31 – 0.60 | Soft hold | "We're verifying your coverage — you'll hear back within 2 hours. No action needed." |
+| RED | 0.61 – 1.00 | Human + AI Review | Claim held; **provisional support credit of ₹200–500 released immediately** so a genuinely stranded worker is never left without support. Case resolved within 24 hours. Confirmed fraud triggers clawback. |
+
+**The RED tier never leaves a legitimate worker without support.** Provisional credit covers immediate needs while the review completes.
 
 ---
 
-### 10.4 The UX Balance Problem: Protecting Honest Workers
+### 10.5 Protecting Honest Workers (UX Balance)
 
-The hardest problem is not detecting fraudsters — it's **not punishing genuine workers** who happen to:
-- Have weak cell signal in a flooded area (making cell tower data unreliable)
-- Be using a VPN (common among privacy-conscious users)
-- Have just onboarded (no behavioral history)
-- Be in a zone with unusual claim density (legitimate disaster)
-
-GigShield handles this through:
+The hardest design problem is not catching fraudsters — it's **not punishing genuine workers** who happen to have weak cell signal in a flooded area, use a VPN, have just onboarded, or live in a zone with unusual legitimate claim density.
 
 **Principle 1: Soft holds, not hard rejections**
-A flagged claim is never immediately rejected. Workers in the 0.31–0.80 FPS range receive a "processing" message, not a denial. Most genuine workers clear enhanced checks within 2 hours.
+A flagged claim is never immediately denied. GREEN/YELLOW/RED is a triage system, not a binary gate.
 
 **Principle 2: Zone context override**
-If IMD, NDMA, or government sources confirm a genuine disaster in the zone, the zone-level fraud threshold is automatically elevated. The system assumes good faith during officially declared disasters and shifts burden of proof.
+When IMD, NDMA, or government sources confirm a genuine declared disaster, zone-level fraud thresholds are automatically elevated. The system shifts burden of proof and assumes good faith during officially declared emergencies.
 
 **Principle 3: Worker reputation credit**
-Workers with 8+ weeks of claim-free history receive a **Trust Score** that lowers effective FPS by up to 0.15 points. Long-tenure honest workers are protected from false positives.
+Workers with 8+ weeks of clean history receive a **Trust Score** reducing effective FPS by up to 0.15 points. Long-tenure honest workers are actively protected from false positives.
 
 **Principle 4: Transparent appeals**
-Every rejected claim generates an auto-explanation (which signals triggered the flag) and a one-tap appeal pathway. Appeals resolved within 4 hours by human reviewer backed by AI summary. This builds trust and catches genuine edge cases.
+Every rejected claim generates an auto-explanation (which signals triggered the flag) and a one-tap appeal pathway. Appeals resolved within 4 hours by human reviewer with AI summary. This builds trust and catches genuine edge cases.
 
-**Principle 5: No permanent blacklisting without review**
-First-time fraud flags result in enhanced monitoring, not bans. Confirmed fraud (pattern + admission + multiple signals) results in suspension with a defined dispute process.
+**Principle 5: No permanent action without confirmed fraud**
+First-time flags → enhanced monitoring. Confirmed fraud (multi-signal pattern) → suspension with defined dispute process. No permanent blacklisting without human review.
 
 ---
 
-### 10.5 What the Syndicate Cannot Fake
+### 10.6 What the Syndicate Cannot Fake
 
-Even a sophisticated 500-member syndicate using coordinated GPS spoofing cannot simultaneously fake:
-1. Cell tower pings consistent with the claimed physical zone
-2. Natural GPS micro-drift (spoofed coordinates are too perfect)
-3. Platform order activity data showing worker was offline before and during disruption
-4. Strava activity showing movement incompatible with being stranded
-5. Claim timing variance — coordinated rings fire claims too uniformly
-6. The network graph: 500 members don't have 500 independent onboarding paths
+Even a sophisticated 500-member ring cannot simultaneously fabricate:
+1. Cell tower IDs consistent with the claimed physical zone
+2. Natural GPS micro-drift (spoofed coordinates are statistically too perfect)
+3. Official IMD/NDMA/government advisories for the claimed crisis
+4. 90-day delivery heatmaps showing they operate in the claimed zone
+5. Platform order activity consistent with being offline during disruption
+6. Claim timing variance — rings fire too uniformly; genuine disruptions spread across the window
+7. Independent onboarding paths — 500 members collapse to a small referral/device graph
 
-The attack surface narrows to a very expensive, high-effort attack that is economically irrational compared to the claim value (₹168–₹900 per event).
+The attack surface narrows to a high-effort, high-coordination operation that is economically irrational at GigShield's per-event payout range (₹168–₹900). The news API corroboration layer alone eliminates any fraud attempt without a real underlying crisis.
 
 ---
 
