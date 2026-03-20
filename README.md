@@ -14,7 +14,7 @@
 4. [Weekly Premium Model](#4-weekly-premium-model)
 5. [Parametric Trigger Definitions](#5-parametric-trigger-definitions)
 6. [AI/ML Integration Plan](#6-aiml-integration-plan)
-7. [Platform Justification: Mobile-First PWA](#7-platform-justification-mobile-first-pwa)
+7. [Platform Justification: Mobile-First Native App](#7-platform-justification-mobile-first-native-app)
 8. [Architecture Overview](#8-architecture-overview)
 9. [Tech Stack](#9-tech-stack)
 10. [Adversarial Defense & Anti-Spoofing Strategy](#10-adversarial-defense--anti-spoofing-strategy)
@@ -24,7 +24,6 @@
     - [Decision Engine (GREEN/YELLOW/RED)](#104-the-decision-engine)
     - [Protecting Honest Workers](#105-protecting-honest-workers-ux-balance)
     - [What the Syndicate Cannot Fake](#106-what-the-syndicate-cannot-fake)
-11. [Development Roadmap](#11-development-roadmap)
 
 ---
 
@@ -286,33 +285,66 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 
 ---
 
-### 6.4 Live Trigger Engine
+### 6.4 Trigger Engine Architecture
 
-**Method**: Multi-source signal aggregation + threshold classifier, running as a background job every 15 minutes
-**Inputs**: OpenWeatherMap (rain > 15 mm/hr, temp > 42°C), CPCB AQI (> 300), IMD flood/cyclone flags, government curfew feeds
-**Output**: Binary disruption flag per zone per 15-minute window → automatically calls fraud scorer → if auto-approved → Razorpay payout → WhatsApp notification
+**Core Design Principle**: The trigger engine uses a **deterministic rule engine — not an LLM — to make all payout decisions**. LLMs are used only upstream, to extract structured signals from unstructured news inputs (e.g., converting "Heavy rainfall warning in Chennai" into a structured JSON event record consumed by the rule engine). This ensures every YES/NO decision is auditable, explainable, and compliant.
+
+**Pipeline** (CRON job, every 5 minutes):
+
+```
+Data Collectors (Order API + Weather API + News API)
+        ↓
+Data Processor (Normalize & structure signals)
+        ↓
+Trigger Engine (Rule-based — deterministic)
+        ↓
+Fraud Checks
+        ↓
+Decision (YES / NO)
+        ↓
+Payment Service (Auto payout)
+```
+
+**Rule Engine Logic**
+
+| Rule | Condition | Decision |
+|------|-----------|----------|
+| Heavy Rainfall | Rainfall > 40mm AND within worker's shift window | Payout = YES |
+| Platform Outage | Order failure rate > 60% in zone | Payout = YES |
+| Government Alert | Official IMD/NDMA/government advisory issued for zone | Payout = YES |
+
+**Platform Outage Detection**: Order failure rate is computed as `(orders_assigned − orders_completed) / orders_assigned`. When a zone-level failure rate exceeds 60% — for example, 2 completions out of 10 assignments gives an 80% failure rate — the system infers a probable platform outage and triggers the T-05 payout pathway.
+
+**LLM Role**: Restricted to the preprocessing step only. The LLM converts unstructured news text (IMD bulletins, government advisories, local incident reports) into structured JSON signal objects. No LLM call participates in the final payout decision.
+
+**Output**: Binary disruption flag per zone per 5-minute window → fraud scorer → if auto-approved → Razorpay / Stripe payout → push/SMS notification via Firebase / Twilio
+
 **Latency target**: < 90 seconds from event detection to payout initiation
+
+**Design principles applied**:
+- Multiple corroborating signals (weather + orders + news) — no single API source can alone trigger a payout
+- Rules are simple, deterministic, and fully traceable to a specific threshold crossing
+- Fraud checks execute before every payout release
+- LLM preprocessing is strictly isolated from the decision path
 
 ---
 
-## 7. Platform Justification: Mobile-First PWA
+## 7. Platform Justification: Mobile-First Native App
 
-### Decision: Progressive Web App (PWA) + WhatsApp-based nudges
+### Decision: React Native / Flutter + Firebase / Twilio notifications
 
-**Why not a native app?**
-- Q-commerce workers already have Zepto/Blinkit apps eating storage
-- Play Store install friction is a real barrier for gig workers
-- PWAs install to home screen in one tap, work offline, and are update-free for the user
+**Why native over PWA?**
+The anti-spoofing engine depends on direct access to device signals — cell tower IDs, Wi-Fi SSID fingerprints, and GPS jitter analysis. PWAs cannot reliably access these signals. A React Native / Flutter app provides:
+- Full native sensor access needed for multi-signal fraud detection
+- Offline-capable operation during disruption windows (patchy connectivity in flooded zones)
+- Single codebase targeting both Android and iOS
+- Background location and push notification support without workarounds
 
-**Why not purely web?**
-- Workers need push notifications for payout confirmations and policy reminders
-- PWAs support push notifications on Android (dominant OS in target demographic)
-
-**Communication Layer**: WhatsApp Business API
-- Policy activation confirmations
-- Disruption alerts ("Your zone is under heavy rain — coverage active")
-- Payout notifications
-- Workers are already on WhatsApp; zero onboarding friction
+**Notification Layer**: Firebase Cloud Messaging (push) + Twilio (SMS fallback)
+- Payout confirmations pushed immediately on disbursement
+- Disruption alerts when the worker's zone trigger fires ("Your zone is under heavy rain — coverage active")
+- Policy activation and renewal reminders
+- SMS fallback via Twilio for workers in low-connectivity areas where push may not land
 
 **Admin/Insurer Dashboard**: React web app (desktop)
 - Loss ratio monitoring
@@ -326,13 +358,19 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 
 ![GigShield Architecture](./Public/architecture.png)
 
-**Flow summary:**
-- **Fraud/verification signals** flow bidirectionally between ML Layer and Anti-Spoofing Engine
-- **External data** feeds both the Trigger Engine (parametric events) and the Anti-Spoofing Engine (location corroboration)
-- **Claim decisions** propagate from the Claim Decision Engine through the Events layer to Output
-- **Rejected claims** loop back to the Human + AI review queue before any account action
+The architecture is organized into five functional columns flowing left to right:
 
-**Data Layer:** Redis (session state, zone disruption cache) · MongoDB (worker profiles, claims, zone events) · PostgreSQL (policies, premiums, payouts — ACID)
+**Ingestion Layer** — The React Native / Flutter worker app routes all requests through Spring Cloud Gateway (JWT auth + rate limiting). Live data feeds (OpenWeatherMap, CPCB AQI, Google Maps traffic, Blinkit Q-Commerce webhooks) are polled every 5 minutes by Spring Scheduler and published to Kafka.
+
+**Services and ML** — Three Spring Boot microservices (User, Policy, Claim) handle core domain logic. A separate ML Intelligence tier runs the Risk Engine (XGBoost → risk_score), Pricing Engine (Gradient Boosting → weekly premium), and Fraud Detector (Isolation Forest → fraud_prob), all in Python (FastAPI).
+
+**Anti-Spoofing Engine** — The Search API Verifier (Brave Search + NewsAPI) and Rider Delivery Zone Profiler (90-day GPS trail from MongoDB) feed the Zone Integrity Checker, which produces a Fraud Probability Score. GREEN claims auto-approve; YELLOW claims enter a 2-hour soft hold; RED claims escalate to Human Review with ₹200–500 provisional credit.
+
+**Payout and Events** — Q-Commerce Webhooks (order_failed / weather_cancelled) and the Weather Rule Engine feed the Auto Payout Orchestrator. On trigger, it verifies active policy + zone match against the Policy Service and emits a payout command to Kafka — zero manual claim filing required.
+
+**Output and Storage** — Kafka routes payout commands to Razorpay / Stripe (UPI + bank transfer) and Firebase / Twilio (push + SMS). All claim decisions and GPS history are persisted to the data layer.
+
+**Data Layer:** MongoDB (GPS trail logs · 90-day delivery history) · PostgreSQL + PostGIS (geospatial zone store · policy and payout records — ACID) · Redis (ML score cache · session state · rate limiting)
 
 ---
 
@@ -341,48 +379,54 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 ### Backend
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| Core Services | Node.js (Express) | Fast I/O, large ecosystem, team familiarity |
+| API Gateway | Spring Cloud Gateway | JWT authentication, rate limiting, and routing across all microservices |
+| Core Microservices | Java Spring Boot | User, Policy, and Claim services — structured domain separation with clear service boundaries |
 | ML Services | Python (FastAPI) | Native ML library support (scikit-learn, XGBoost, Prophet) |
-| Event Streaming | Apache Kafka | Real-time disruption event pipeline, decoupled trigger processing |
-| Primary Database | MongoDB | Flexible schema for worker profiles, claims, zone events |
-| Transactional DB | PostgreSQL | ACID compliance for policy and payout records |
-| Cache | Redis | Session management, zone disruption state, rate limiting |
+| Event Streaming | Apache Kafka | Decoupled real-time pipeline for weather triggers, order failures, and payout commands |
+| Scheduler | Spring Scheduler | CRON-based polling of OpenWeather, AQI, and Maps APIs every 5 minutes |
+| Primary Database | MongoDB | GPS trail logs and 90-day delivery history for zone profiling |
+| Geospatial / Transactional DB | PostgreSQL + PostGIS | Zone boundary store, policy and payout records — ACID with native spatial queries |
+| Cache | Redis | ML score cache, session state, zone disruption state, rate limiting |
 
 ### Frontend
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| Worker App | React PWA | One codebase, installable, offline-capable |
-| Admin Dashboard | React + Recharts | Rich data visualization for insurer view |
-| Notifications | Firebase Cloud Messaging | Push to Android without native app |
-| Communication | WhatsApp Business API | Zero-friction for target demographic |
+| Worker App | React Native / Flutter | Cross-platform native mobile — required for direct device signal access (cell tower IDs, Wi-Fi SSID fingerprints, GPS jitter) used by the anti-spoofing engine |
+| Admin Dashboard | React + Recharts | Rich data visualization for insurer view — loss ratios, zone heat maps, claim queue |
+| Push Notifications | Firebase Cloud Messaging | Payout confirmations and disruption alerts on Android/iOS |
+| SMS Fallback | Twilio | Delivery for low-connectivity workers where push notifications may not land |
 
 ### ML/AI
 | Model | Framework | Purpose |
 |-------|-----------|---------|
-| Premium Pricing | XGBoost (Python) | Weekly risk multiplier per worker |
-| Fraud Detection | Isolation Forest + LSTM | Anomaly scoring on claims |
-| Disruption Classifier | Multi-signal threshold + rule engine | Zone-level event detection |
-| Income Forecasting | Facebook Prophet | Counterfactual earnings baseline |
+| Risk Scoring | XGBoost (Python) | Weather severity + zone danger → `risk_score` per worker zone |
+| Premium Pricing | Gradient Boosting (Python) | `risk_score` + AQI + worker history → personalised weekly premium |
+| Fraud Detection | Isolation Forest (Python) | Device fingerprint + surge velocity → `fraud_prob` (0.0–1.0) |
+| Disruption Trigger | Deterministic rule engine | Zone-level YES/NO payout decision — no ML in the decision path |
+| Disruption Forecasting | Facebook Prophet | Next 4-week disruption frequency + loss ratio projection per zone |
 
 ### Infrastructure
 | Service | Provider | Notes |
 |---------|----------|-------|
 | Cloud | AWS (or GCP) | EC2/Cloud Run for services |
 | Container Orchestration | Docker Compose (Phase 1–2), K8s (Phase 3) | Progressive scaling |
-| API Gateway | Kong / AWS API Gateway | Auth, rate limiting, routing |
+| Real-Time Updates | WebSocket / STOMP | Live rider dashboard — claim status and payout progress |
 | Monitoring | Grafana + Prometheus | System health + claim flow metrics |
 
 ### External APIs
 | API | Purpose | Tier |
 |-----|---------|------|
-| OpenWeatherMap | Real-time + forecast weather per zone | Free tier / mock |
-| IMD (India Met) | Official alerts, cyclone/flood advisories | Public feed |
+| OpenWeatherMap | Real-time + forecast weather per zone (rainfall, temperature, wind) | Free tier / mock |
+| IMD (India Met) | Official cyclone, flood, and severe weather advisories | Public feed |
 | CPCB AQI | Air quality index per city | Public API |
-| Cell Tower (OpenCelliD) | Cross-verify device location with tower | Free tier |
-| IP Geolocation | Detect VPN/proxy usage | Free tier |
-| Strava API | Cross-verify claimed physical location via activity data | OAuth / mock |
-| Razorpay (Sandbox) | UPI payouts simulation | Sandbox |
-| Brave Search API | News signals for civil disruptions | Free tier |
+| Google Maps API | Real-time traffic and road closure signals for civil disruption triggers | Pay-per-use |
+| Blinkit Q-Commerce API | `order_failed` / `order_cancelled_by_weather` webhooks — zero-claim outage trigger | Partner integration |
+| Telecom Cell Tower API | Tower ID triangulation for physical location verification | Free tier |
+| IP Geolocation (MaxMind) | Detect VPN/proxy usage and home broadband vs. field mobile data | Free tier |
+| Brave Search API | Live crisis event search — confirms storm/flood for claimed zone | Free tier |
+| NewsAPI | Breaking weather and disaster news corroboration | Free tier |
+| Razorpay / Stripe | UPI + bank transfer instant disbursement | Sandbox / production |
+| Firebase / Twilio | Push notifications (Firebase) + SMS fallback (Twilio) for payout alerts | Free tier / pay-per-use |
 
 ---
 
@@ -401,7 +445,7 @@ GPS spoofing via apps like Fake GPS, iToolab AnyGo, or rooted-device mock provid
 The attacker cannot simultaneously fake:
 - Cell tower triangulation (device pings real towers in the claimed zone)
 - IP geolocation (home broadband vs mobile data in field)
-- Device sensor readings (accelerometer, Wi-Fi SSID)
+- Device signals (Wi-Fi SSID, GPS jitter)
 - Historical delivery patterns (90-day heatmap of where the worker actually operates)
 - Independent public news corroboration of the crisis event
 - Claim timing variance (coordinated rings file at the same second; genuine workers file gradually)
@@ -421,7 +465,7 @@ Our defense exploits this asymmetry across four signal layers.
 | Wi-Fi SSID Fingerprint | Device connected to home Wi-Fi while claiming to be in a flood zone | Passive detection — only metadata flag stored, no SSID value |
 | GPS Jitter Analysis | Spoofed GPS has unnaturally perfect coordinates; real GPS micro-drifts | Statistical variance on GPS readings over 5-minute window |
 
-A spoofed actor at home shows stationary accelerometer + home Wi-Fi + perfect GPS coordinates — three contradictions in one claim.
+A spoofed actor at home shows home Wi-Fi SSID + perfect GPS coordinates with no natural jitter — two contradictions in one claim.
 
 #### Signal Layer 2: Historical Delivery Zone Match
 
@@ -453,7 +497,6 @@ This makes coordinated fraud expensive: the syndicate cannot fabricate official 
 | Signal | What It Detects |
 |--------|----------------|
 | Device location consistency | Is device physically in the zone during disruption, or at home? Cross-checked via cell tower + Wi-Fi fingerprint — not order status |
-| Accelerometer pattern | Stationary-at-home pattern vs. out-in-field pattern during disruption window |
 | Claim-initiation latency | Claims filed < 30 sec after trigger fire are flagged — genuine workers don't have push-to-claim reflexes |
 | Strava / fitness app cross-check | Did worker log movement incompatible with being in a disrupted zone? (Opt-in, incentivised with premium discount) |
 | Orders completed during disruption | If worker completed a delivery *during* the disrupted window → claim auto-rejected (they were clearly working through it) |
@@ -535,36 +578,6 @@ Even a sophisticated 500-member ring cannot simultaneously fabricate:
 7. Independent onboarding paths — 500 members collapse to a small referral/device graph
 
 The attack surface narrows to a high-effort, high-coordination operation that is economically irrational at GigShield's per-event payout range (₹168–₹900). The news API corroboration layer alone eliminates any fraud attempt without a real underlying crisis.
-
----
-
-## 11. Development Roadmap
-
-### Phase 1 (Current — March 20): Foundation & Ideation
-- [x] Problem research and persona definition
-- [x] Solution architecture design
-- [x] Weekly premium model design
-- [x] Parametric trigger definitions
-- [x] Anti-spoofing strategy documentation
-- [ ] GitHub repository scaffolding
-- [ ] 2-minute pitch video
-
-### Phase 2 (Weeks 3–4): Build & Protect
-- [ ] Worker registration and onboarding flow
-- [ ] Policy management (create, activate, renew, cancel)
-- [ ] Dynamic premium calculation engine
-- [ ] Parametric trigger monitoring (weather + platform APIs)
-- [ ] Automated claim initiation pipeline
-- [ ] Fraud detection MVP (zone anomaly + location stack)
-- [ ] Mock payout via Razorpay sandbox
-
-### Phase 3 (Weeks 5–6): Scale & Optimize
-- [ ] Full anti-spoofing engine integration (all 4 signal layers)
-- [ ] Human + AI review queue for flagged claims
-- [ ] Worker dashboard (coverage status, payout history)
-- [ ] Admin/insurer dashboard (loss ratios, predictive analytics)
-- [ ] End-to-end simulated disruption demo
-- [ ] Final pitch deck
 
 ---
 
