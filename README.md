@@ -1,4 +1,4 @@
-# GigShield — AI-Powered Parametric Income Protection for India's Gig Delivery Workers
+# EarnGaurd — AI-Powered Parametric Income Protection for India's Gig Delivery Workers
 
 > **Hackathon**: Guidewire DEVTrails 2026 — "Unicorn Chase"
 > **Phase 1 Submission**: Ideation & Foundation (Deadline: March 20, 2026)
@@ -39,7 +39,7 @@ When external disruptions occur — heavy rainfall, cyclones, AQI-based shutdown
 - No product in the market addresses **parametric income protection** tuned to gig workers
 - Manual claims processes are too slow and inaccessible for daily-wage earners
 
-**GigShield's answer:** An AI-powered, parametric insurance platform that *automatically* detects disruptions, verifies eligibility, and initiates payouts — without the worker filing a single form.
+**EarnGaurd's answer:** An AI-powered, parametric insurance platform that *automatically* detects disruptions, verifies eligibility, and initiates payouts — without the worker filing a single form.
 
 ---
 
@@ -82,7 +82,7 @@ Q-commerce workers operate within **tight geographic zones** anchored to dark st
 
 ## 3. Solution Overview
 
-GigShield is a **parametric income insurance platform** built for Q-commerce delivery partners. It requires no claims filing — the system monitors external signals, detects covered disruptions, verifies worker eligibility, and triggers a payout automatically.
+EarnGaurd is a **parametric income insurance platform** built for Q-commerce delivery partners. It requires no claims filing — the system monitors external signals, detects covered disruptions, verifies worker eligibility, and triggers a payout automatically.
 
 ### How It Works — End-to-End Flow
 
@@ -102,7 +102,7 @@ Claim Auto-Approved OR Flagged for Human+AI Review
 Payout to UPI within 60 seconds
 ```
 
-### What GigShield Covers (and doesn't)
+### What EarnGaurd Covers (and doesn't)
 
 | Covered | Not Covered |
 |---------|-------------|
@@ -215,7 +215,7 @@ Payout = ₹75 × 3 × 0.75 = **₹168.75**, auto-disbursed to UPI — whether h
 
 ## 6. AI/ML Integration Plan
 
-GigShield uses three purpose-built models. Models 1 and 2 are customer-facing and directly affect payouts. Model 3 powers the admin dashboard and is built in Phase 3.
+EarnGaurd uses three purpose-built models. Models 1 and 2 are customer-facing and directly affect payouts. Model 3 powers the admin dashboard and is built in Phase 3.
 
 ---
 
@@ -254,7 +254,7 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 
 **Method**: Two-phase approach
 - **Phase 2** — Deterministic rule engine: 5 checks (GPS distance, time window, amount ratio, claim frequency, duplicate detection) produce a weighted score
-- **Phase 3** — Isolation Forest blended with rule score (60% rules + 40% ML), trained on the Kaggle dataset with GigShield-specific feature mapping
+- **Phase 3** — Isolation Forest blended with rule score (60% rules + 40% ML), trained on the Kaggle dataset with EarnGaurd-specific feature mapping
 
 | Score | Decision |
 |-------|----------|
@@ -262,7 +262,7 @@ GigShield uses three purpose-built models. Models 1 and 2 are customer-facing an
 | 0.30 – 0.69 | Manual review — 30-minute SLA |
 | 0.70 – 1.0 | Auto-reject — logged for pattern analysis |
 
-**Why Isolation Forest**: Unsupervised anomaly detection — does not require large labeled GigShield-specific fraud datasets to function, which matters for a bootstrapping platform. It naturally isolates rare fraud events embedded in dense legitimate claim distributions, with no assumptions about the fraud feature distribution. The blended approach ensures the rule engine catches obvious fraud immediately while the ML layer catches subtle coordinated patterns that rules miss.
+**Why Isolation Forest**: Unsupervised anomaly detection — does not require large labeled EarnGaurd-specific fraud datasets to function, which matters for a bootstrapping platform. It naturally isolates rare fraud events embedded in dense legitimate claim distributions, with no assumptions about the fraud feature distribution. The blended approach ensures the rule engine catches obvious fraud immediately while the ML layer catches subtle coordinated patterns that rules miss.
 
 ---
 
@@ -356,7 +356,7 @@ The anti-spoofing engine depends on direct access to device signals — cell tow
 
 ## 8. Architecture Overview
 
-![GigShield Architecture](./Public/architecture.png)
+![EarnGaurd Architecture](./Public/architecture.png)
 
 The architecture is organized into five functional columns flowing left to right:
 
@@ -434,7 +434,7 @@ The architecture is organized into five functional columns flowing left to right
 
 > **Threat scenario**: A coordinated syndicate of 500 delivery workers in a Tier-1 city used GPS-spoofing apps to fake locations, appearing stranded in weather zones while resting at home. Coordinated via Telegram, they triggered mass false payouts and drained the liquidity pool.
 >
-> **Design ruling**: Simple GPS verification is obsolete. GigShield's defense is built on one core insight — **a real crisis leaves a consistent fingerprint across multiple independent signals; a spoofer can only fake one or two.**
+> **Design ruling**: Simple GPS verification is obsolete. EarnGaurd's defense is built on one core insight — **a real crisis leaves a consistent fingerprint across multiple independent signals; a spoofer can only fake one or two.**
 
 ---
 
@@ -577,8 +577,8 @@ Even a sophisticated 500-member ring cannot simultaneously fabricate:
 6. Claim timing variance — rings fire too uniformly; genuine disruptions spread across the window
 7. Independent onboarding paths — 500 members collapse to a small referral/device graph
 
-The attack surface narrows to a high-effort, high-coordination operation that is economically irrational at GigShield's per-event payout range (₹168–₹900). The news API corroboration layer alone eliminates any fraud attempt without a real underlying crisis.
+The attack surface narrows to a high-effort, high-coordination operation that is economically irrational at EarnGaurd's per-event payout range (₹168–₹900). The news API corroboration layer alone eliminates any fraud attempt without a real underlying crisis.
 
 ---
 
-*GigShield — Because every delivery matters, even the ones that never happen.*
+*EarnGaurd — Because every delivery matters, even the ones that never happen.*
