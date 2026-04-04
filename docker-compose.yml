@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: earnguard-postgres
+    environment:
+      POSTGRES_DB: earnguard
+      POSTGRES_USER: earnguard
+      POSTGRES_PASSWORD: earnguard_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U earnguard -d earnguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./earnguard-backend
+      dockerfile: Dockerfile
+    container_name: earnguard-backend
+    environment:
+      DB_URL: "jdbc:postgresql://postgres:5432/earnguard"
+      DB_USERNAME: earnguard
+      DB_PASSWORD: earnguard_secret
+      JWT_SECRET: "EarnGuardSecretKey2026ProductionGradeMinimum256BitsLongSecretKeyForHS256Algorithm"
+      JWT_EXPIRY: 86400000
+      FRONTEND_URL: "http://localhost:3000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: earnguard-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:8080"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
