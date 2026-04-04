@@ -1,0 +1,61 @@
+version: "3.9"
+
+# Production docker-compose for AWS EC2
+# Usage: EC2_IP=<your-elastic-ip> docker compose -f docker-compose.prod.yml up --build -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: earnguard-postgres
+    environment:
+      POSTGRES_DB: earnguard
+      POSTGRES_USER: earnguard
+      POSTGRES_PASSWORD: earnguard_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U earnguard -d earnguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./earnguard-backend
+      dockerfile: Dockerfile
+    container_name: earnguard-backend
+    environment:
+      DB_URL: "jdbc:postgresql://postgres:5432/earnguard"
+      DB_USERNAME: earnguard
+      DB_PASSWORD: earnguard_secret
+      JWT_SECRET: "EarnGuardSecretKey2026ProductionGradeMinimum256BitsLongSecretKeyForHS256Algorithm"
+      JWT_EXPIRY: 86400000
+      FRONTEND_URL: "http://${EC2_IP}:3000"
+      # Limit JVM heap to prevent OOM on t2.micro (1GB RAM)
+      JAVA_OPTS: "-Xms128m -Xmx384m"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        # NEXT_PUBLIC_API_URL is baked at build time — must be passed as build arg, not runtime env
+        NEXT_PUBLIC_API_URL: "http://${EC2_IP}:8080"
+    container_name: earnguard-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pg_data:
